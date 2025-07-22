@@ -1,0 +1,12 @@
+streamlit>=1.28.0
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langgraph>=0.0.20
+langsmith>=0.0.70
+yfinance>=0.2.18
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.15.0
+requests>=2.31.0
+python-dateutil>=2.8.2
+# concurrent-futures>=3.1.1  # Optional, but already in stdlib since Python 3.2
