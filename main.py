@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -17,9 +16,6 @@ from langchain.schema import HumanMessage, SystemMessage
 from langchain.callbacks.base import BaseCallbackHandler
 from langsmith import Client
 from langgraph.graph import END, StateGraph
-# from langgraph.prebuilt import ToolExecutor
-# from langgraph.prebuilt import ToolNode
-
 from langchain.tools import BaseTool
 from langchain.callbacks.tracers import LangChainTracer
 import os
@@ -27,551 +23,487 @@ from concurrent.futures import ThreadPoolExecutor
 import warnings
 warnings.filterwarnings('ignore')
 
-# Initialize LangSmith
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
+# Initialize LangSmith (will be conditionally enabled)
 os.environ["LANGCHAIN_PROJECT"] = "financial-analysis-agent"
-import os
-os.environ["LANGCHAIN_API_KEY"] = "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"
-os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 
+# New imports for ranking functionality
+from typing import TypedDict, Annotated
+import math
+import time
 
-
-from typing import TypedDict
-from typing import Annotated
-
-class AnalysisState(TypedDict, total=False):
-    ticker: Annotated[str, "multiple"]
-    duration: str
-    risk_free_rate: float
-    market_risk_premium: float
-    financial_data: dict
-    comparable_data: dict
-    market_data: dict
-    period: str
-    market_price_analysis: dict
-    comparable_analysis: dict
-    dcf_analysis: dict
-    asset_analysis: dict
-    final_synthesis: dict
-
-
-
-
-
-@dataclass
-class AnalysisParameters:
-    ticker: str
-    duration: str
-    analysis_depth: str = "comprehensive"
-    include_comparables: bool = True
-    risk_free_rate: float = 0.045  # Current 10Y Treasury
-    market_risk_premium: float = 0.06
-    growth_rate: float = 0.025
-
-class FinancialDataTool(BaseTool):
-    name: str = "financial_data_extractor"
-    description: str = "Extracts comprehensive financial data for a given ticker"
+def show_thinking_animation():
+    """Show a thinking animation with different states"""
     
-    def _run(self, ticker: str, period: str = "5y") -> Dict[str, Any]:
-        try:
-            stock = yf.Ticker(ticker)
-            
-            # Get historical data
-            hist_data = stock.history(period=period)
-            
-            # Get financial statements
-            financials = stock.financials
-            balance_sheet = stock.balance_sheet
-            cash_flow = stock.cashflow
-            
-            # Get stock info
-            info = stock.info
-            
-            # Get analyst recommendations
-            recommendations = stock.recommendations
-            
-            return {
-                "historical_data": hist_data,
-                "financials": financials,
-                "balance_sheet": balance_sheet,
-                "cash_flow": cash_flow,
-                "info": info,
-                "recommendations": recommendations,
-                "success": True
+    # Create thinking animation
+    thinking_container = st.container()
+    with thinking_container:
+        st.markdown("🤔 **FinBot is thinking...**")
+        
+        # Create animated dots
+        dots = st.empty()
+        for i in range(3):
+            dots.markdown("." * (i + 1))
+            time.sleep(0.3)
+        
+        dots.empty()
+    
+    return thinking_container
+
+# Load S&P 500 financial data
+@st.cache_data
+def load_sp500_data():
+    """Load S&P 500 financial data from CSV"""
+    try:
+        df = pd.read_csv('sp500_financial_data.csv')
+        # Filter only successful data entries
+        df = df[df['status'] == 'success']
+        return df
+    except Exception as e:
+        st.error(f"Error loading S&P 500 data: {str(e)}")
+        return pd.DataFrame()
+
+# Valuation calculation functions with detailed explanations
+def calculate_asset_based_value(row, show_calculation=False):
+    """Calculate asset-based valuation with detailed breakdown"""
+    try:
+        total_assets = row['assets'] if pd.notna(row['assets']) else 0
+        total_liabilities = row['liabilities'] if pd.notna(row['liabilities']) else 0
+        goodwill = row['goodwill'] if pd.notna(row['goodwill']) else 0
+        intangible_assets = row['intangible_assets'] if pd.notna(row['intangible_assets']) else 0
+        
+        # Calculate book value
+        book_value = total_assets - total_liabilities
+        
+        # Calculate tangible book value
+        tangible_book_value = book_value - goodwill - intangible_assets
+        
+        # Apply conservative estimate
+        conservative_estimate = book_value * 0.8
+        fair_value = max(tangible_book_value, conservative_estimate)
+        
+        if show_calculation:
+            calculation_details = {
+                'total_assets': total_assets,
+                'total_liabilities': total_liabilities,
+                'goodwill': goodwill,
+                'intangible_assets': intangible_assets,
+                'book_value': book_value,
+                'tangible_book_value': tangible_book_value,
+                'conservative_estimate': conservative_estimate,
+                'final_fair_value': fair_value
             }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            return fair_value, calculation_details
+        
+        return fair_value
+    except:
+        return 0
 
-class ComparableCompanyTool(BaseTool):
-    name: str = "comparable_company_finder"
-    description: str = "Finds comparable companies in the same industry"
-    
-    def _run(self, ticker: str, industry: str, market_cap: float) -> Dict[str, Any]:
-        try:
-            # This would ideally use a more sophisticated API like Bloomberg or FactSet
-            # For demo purposes, we'll use a simplified approach
-            stock = yf.Ticker(ticker)
-            sector = stock.info.get('sector', '')
-            
-            # Get some comparable tickers (this is simplified - in production, use proper screeners)
-            comparable_tickers = self._get_comparable_tickers(sector)
-            
-            comparables_data = {}
-            for comp_ticker in comparable_tickers[:5]:  # Limit to 5 comparables
-                try:
-                    comp_stock = yf.Ticker(comp_ticker)
-                    comp_info = comp_stock.info
-                    if comp_info.get('marketCap', 0) > 0:
-                        comparables_data[comp_ticker] = comp_info
-                except:
-                    continue
-            
-            return {
-                "comparables": comparables_data,
-                "success": True
+def calculate_dcf_value(row, risk_free_rate=0.045, market_risk_premium=0.06, show_calculation=False):
+    """Calculate DCF valuation with detailed breakdown"""
+    try:
+        # Get free cash flow
+        fcf = row['free_cash_flow'] if pd.notna(row['free_cash_flow']) else 0
+        
+        # If no FCF, try to calculate from operating cash flow
+        if fcf == 0:
+            operating_cf = row['net_cash_flow_from_operating_activities'] if pd.notna(row['net_cash_flow_from_operating_activities']) else 0
+            capex = abs(row['capital_expenditure']) if pd.notna(row['capital_expenditure']) else 0
+            fcf = operating_cf - capex
+        
+        if fcf <= 0:
+            return 0
+        
+        # Estimate beta (simplified - in practice would use market data)
+        beta = 1.0  # Default beta
+        
+        # Calculate WACC
+        cost_of_equity = risk_free_rate + beta * market_risk_premium
+        wacc = cost_of_equity  # Simplified - no debt component
+        
+        # Growth assumptions
+        growth_rate = 0.05  # 5% growth for 5 years
+        terminal_growth = 0.025  # 2.5% terminal growth
+        
+        # Project FCF for 5 years
+        projected_fcf = []
+        for year in range(1, 6):
+            projected_fcf.append(fcf * (1 + growth_rate) ** year)
+        
+        # Calculate terminal value
+        terminal_value = projected_fcf[-1] * (1 + terminal_growth) / (wacc - terminal_growth)
+        
+        # Discount to present value
+        total_pv = sum([fcf / (1 + wacc) ** (i + 1) for i, fcf in enumerate(projected_fcf)])
+        terminal_pv = terminal_value / (1 + wacc) ** 5
+        
+        enterprise_value = total_pv + terminal_pv
+        
+        # Convert to equity value (simplified)
+        equity_value = enterprise_value
+        
+        if show_calculation:
+            calculation_details = {
+                'base_fcf': fcf,
+                'beta': beta,
+                'risk_free_rate': risk_free_rate,
+                'market_risk_premium': market_risk_premium,
+                'cost_of_equity': cost_of_equity,
+                'wacc': wacc,
+                'growth_rate': growth_rate,
+                'terminal_growth': terminal_growth,
+                'projected_fcf': projected_fcf,
+                'terminal_value': terminal_value,
+                'total_pv': total_pv,
+                'terminal_pv': terminal_pv,
+                'enterprise_value': enterprise_value,
+                'final_equity_value': equity_value
             }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-    
-    def _get_comparable_tickers(self, sector: str) -> List[str]:
-        # Simplified mapping - in production, use proper industry classification
-        sector_mapping = {
-            'Technology': ['AAPL', 'MSFT', 'GOOGL', 'META', 'NVDA', 'CRM', 'ADBE', 'ORCL'],
-            'Healthcare': ['JNJ', 'PFE', 'UNH', 'MRK', 'CVS', 'ABBV', 'TMO'],
-            'Financial Services': ['JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'BLK'],
-            'Consumer Cyclical': ['AMZN', 'TSLA', 'HD', 'NKE', 'MCD', 'SBUX'],
-            'Energy': ['XOM', 'CVX', 'COP', 'SLB', 'EOG', 'PXD'],
-            'Industrials': ['BA', 'CAT', 'GE', 'MMM', 'UNP', 'LMT'],
-        }
-        return sector_mapping.get(sector, ['SPY', 'QQQ', 'DIA'])  # Default to ETFs
+            return equity_value, calculation_details
+        
+        return equity_value
+    except:
+        return 0
 
-class MarketDataTool(BaseTool):
-    name: str = "market_data_collector"
-    description: str = "Collects broader market data and economic indicators"
-    
-    def _run(self, period: str = "5y") -> Dict[str, Any]:
-        try:
-            # Get market indices
-            sp500 = yf.Ticker("^GSPC").history(period=period)
-            nasdaq = yf.Ticker("^IXIC").history(period=period)
-            dow = yf.Ticker("^DJI").history(period=period)
-            
-            # Get treasury rates (using ETFs as proxy)
-            ten_year = yf.Ticker("^TNX").history(period=period)
-            
-            # Get VIX for volatility
-            vix = yf.Ticker("^VIX").history(period=period)
-            
-            return {
-                "sp500": sp500,
-                "nasdaq": nasdaq,
-                "dow": dow,
-                "ten_year_treasury": ten_year,
-                "vix": vix,
-                "success": True
+def calculate_comparable_value(row, show_calculation=False):
+    """Calculate comparable company valuation with detailed breakdown"""
+    try:
+        # Get key metrics
+        revenue = row['revenues'] if pd.notna(row['revenues']) else 0
+        net_income = row['net_income_loss'] if pd.notna(row['net_income_loss']) else 0
+        book_value = row['book_value'] if pd.notna(row['book_value']) else 0
+        
+        if revenue <= 0 or net_income <= 0:
+            return 0
+        
+        # Industry average multiples (simplified - would use actual peer data)
+        ev_revenue_multiple = 2.0
+        pe_multiple = 15.0
+        pb_multiple = 1.5
+        
+        # Calculate valuations using different multiples
+        ev_revenue_value = revenue * ev_revenue_multiple
+        pe_value = net_income * pe_multiple
+        pb_value = book_value * pb_multiple
+        
+        # Average the valuations
+        avg_value = (ev_revenue_value + pe_value + pb_value) / 3
+        
+        if show_calculation:
+            calculation_details = {
+                'revenue': revenue,
+                'net_income': net_income,
+                'book_value': book_value,
+                'ev_revenue_multiple': ev_revenue_multiple,
+                'pe_multiple': pe_multiple,
+                'pb_multiple': pb_multiple,
+                'ev_revenue_value': ev_revenue_value,
+                'pe_value': pe_value,
+                'pb_value': pb_value,
+                'final_avg_value': avg_value
             }
+            return avg_value, calculation_details
+        
+        return avg_value
+    except:
+        return 0
+
+def calculate_rankings(df, valuation_method, risk_free_rate=0.045, market_risk_premium=0.06, show_progress=True):
+    """Calculate rankings based on selected valuation method with progress tracking"""
+    results = []
+    
+    if show_progress:
+        # Create a more sophisticated progress display
+        progress_container = st.container()
+        with progress_container:
+            st.markdown("**📊 Processing Companies:**")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+            
+            with metrics_col1:
+                companies_processed = st.metric("Companies Processed", "0")
+            with metrics_col2:
+                successful_calculations = st.metric("Successful Calculations", "0")
+            with metrics_col3:
+                current_company = st.metric("Current Company", "Starting...")
+    
+    total_companies = len(df)
+    successful_count = 0
+    
+    for idx, (_, row) in enumerate(df.iterrows()):
+        try:
+            ticker = row['ticker']
+            company_name = row['company_name']
+            sector = row['sector']
+            
+            if show_progress:
+                progress = (idx + 1) / total_companies
+                progress_bar.progress(progress)
+                status_text.text(f"🔍 Analyzing {ticker} - {company_name}")
+                
+                # Update metrics
+                companies_processed.metric("Companies Processed", f"{idx + 1}/{total_companies}")
+                current_company.metric("Current Company", f"{ticker}")
+            
+            if valuation_method == "Asset Based Value":
+                fair_value = calculate_asset_based_value(row)
+            elif valuation_method == "Discounted Cash Flow Value":
+                fair_value = calculate_dcf_value(row, risk_free_rate, market_risk_premium)
+            elif valuation_method == "Comparable Company Analysis":
+                fair_value = calculate_comparable_value(row)
+            else:
+                continue
+            
+            if fair_value > 0:
+                successful_count += 1
+                results.append({
+                    'ticker': ticker,
+                    'company_name': company_name,
+                    'sector': sector,
+                    'fair_value': fair_value,
+                    'revenue': row['revenues'] if pd.notna(row['revenues']) else 0,
+                    'net_income': row['net_income_loss'] if pd.notna(row['net_income_loss']) else 0,
+                    'book_value': row['book_value'] if pd.notna(row['book_value']) else 0
+                })
+                
+                if show_progress:
+                    successful_calculations.metric("Successful Calculations", f"{successful_count}")
+                    
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            continue
+    
+    if show_progress:
+        # Final status update
+        progress_bar.progress(1.0)
+        status_text.text("✅ Analysis complete! Sorting results...")
+        companies_processed.metric("Companies Processed", f"{total_companies}/{total_companies}")
+        successful_calculations.metric("Successful Calculations", f"{successful_count}")
+        current_company.metric("Status", "Complete")
+        
+        time.sleep(1.5)
+        progress_container.empty()
+    
+    # Sort by fair value (descending)
+    results.sort(key=lambda x: x['fair_value'], reverse=True)
+    
+    # Add ranking
+    for i, result in enumerate(results):
+        result['rank'] = i + 1
+    
+    return results
+
+def show_parameter_confirmation(valuation_method, risk_free_rate=None, market_risk_premium=None):
+    """Show parameter confirmation before calculations"""
+    
+    st.subheader("🔍 Parameter Confirmation")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.info(f"**Valuation Method:** {valuation_method}")
+        
+        if valuation_method == "Asset Based Value":
+            st.markdown("""
+            **Methodology:**
+            - Calculates tangible book value (Total Assets - Total Liabilities - Intangible Assets - Goodwill)
+            - Applies conservative 80% discount to book value
+            - Uses the higher of tangible book value or conservative estimate
+            """)
+            
+        elif valuation_method == "Discounted Cash Flow Value":
+            st.markdown(f"""
+            **Methodology:**
+            - Projects free cash flows for 5 years with {risk_free_rate*100:.1f}% risk-free rate
+            - Uses {market_risk_premium*100:.1f}% market risk premium for discount rate calculation
+            - Applies 5% growth rate for first 5 years, 2.5% terminal growth
+            - Discounts all cash flows to present value using WACC
+            """)
+            
+        elif valuation_method == "Comparable Company Analysis":
+            st.markdown("""
+            **Methodology:**
+            - Uses industry average multiples: EV/Revenue (2.0x), P/E (15.0x), P/B (1.5x)
+            - Calculates value using each multiple
+            - Averages the three approaches for final valuation
+            """)
+    
+    with col2:
+        st.metric("Companies to Analyze", "503")
+        st.metric("Data Quality", "High")
+        st.metric("Processing Time", "~30 seconds")
+    
+    # Confirmation button
+    if st.button("🚀 Start Analysis", type="primary"):
+        return True
+    
+    return False
+
+def show_calculation_example(valuation_method, risk_free_rate=None, market_risk_premium=None):
+    """Show a sample calculation for the selected method"""
+    
+    st.subheader("🧮 Sample Calculation")
+    
+    # Load sample data
+    df = load_sp500_data()
+    if df.empty:
+        return
+    
+    # Use a well-known company for the example
+    sample_companies = ['AAPL', 'MSFT', 'GOOGL']
+    sample_row = None
+    
+    for ticker in sample_companies:
+        sample_data = df[df['ticker'] == ticker]
+        if not sample_data.empty:
+            sample_row = sample_data.iloc[0]
+            break
+    
+    if sample_row is None:
+        sample_row = df.iloc[0]
+    
+    ticker = sample_row['ticker']
+    company_name = sample_row['company_name']
+    
+    st.info(f"**Example calculation for {ticker} - {company_name}**")
+    
+    if valuation_method == "Asset Based Value":
+        fair_value, details = calculate_asset_based_value(sample_row, show_calculation=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Input Values:**")
+            st.write(f"- Total Assets: ${details['total_assets']/1e9:.2f}B")
+            st.write(f"- Total Liabilities: ${details['total_liabilities']/1e9:.2f}B")
+            st.write(f"- Goodwill: ${details['goodwill']/1e9:.2f}B")
+            st.write(f"- Intangible Assets: ${details['intangible_assets']/1e9:.2f}B")
+        
+        with col2:
+            st.markdown("**Calculations:**")
+            st.write(f"- Book Value: ${details['book_value']/1e9:.2f}B")
+            st.write(f"- Tangible Book Value: ${details['tangible_book_value']/1e9:.2f}B")
+            st.write(f"- Conservative Estimate: ${details['conservative_estimate']/1e9:.2f}B")
+            st.write(f"**Final Fair Value: ${details['final_fair_value']/1e9:.2f}B**")
+    
+    elif valuation_method == "Discounted Cash Flow Value":
+        fair_value, details = calculate_dcf_value(sample_row, risk_free_rate, market_risk_premium, show_calculation=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Key Parameters:**")
+            st.write(f"- Base FCF: ${details['base_fcf']/1e6:.0f}M")
+            st.write(f"- Risk-free Rate: {details['risk_free_rate']*100:.1f}%")
+            st.write(f"- Market Risk Premium: {details['market_risk_premium']*100:.1f}%")
+            st.write(f"- WACC: {details['wacc']*100:.1f}%")
+            st.write(f"- Growth Rate: {details['growth_rate']*100:.1f}%")
+        
+        with col2:
+            st.markdown("**Projected Cash Flows:**")
+            for i, fcf in enumerate(details['projected_fcf']):
+                st.write(f"- Year {i+1}: ${fcf/1e6:.0f}M")
+            st.write(f"- Terminal Value: ${details['terminal_value']/1e9:.2f}B")
+            st.write(f"**Final Enterprise Value: ${details['final_equity_value']/1e9:.2f}B**")
+    
+    elif valuation_method == "Comparable Company Analysis":
+        fair_value, details = calculate_comparable_value(sample_row, show_calculation=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Financial Metrics:**")
+            st.write(f"- Revenue: ${details['revenue']/1e9:.2f}B")
+            st.write(f"- Net Income: ${details['net_income']/1e9:.2f}B")
+            st.write(f"- Book Value: ${details['book_value']/1e9:.2f}B")
+        
+        with col2:
+            st.markdown("**Valuation Multiples:**")
+            st.write(f"- EV/Revenue: ${details['ev_revenue_value']/1e9:.2f}B")
+            st.write(f"- P/E: ${details['pe_value']/1e9:.2f}B")
+            st.write(f"- P/B: ${details['pb_value']/1e9:.2f}B")
+            st.write(f"**Average Fair Value: ${details['final_avg_value']/1e9:.2f}B**")
 
 class FinancialAnalysisAgent:
     def __init__(self, openai_api_key: str, langsmith_api_key: str = None):
+        # Configure LangSmith tracing if API key is provided
+        callbacks = []
+        if langsmith_api_key:
+            # Set environment variables for LangSmith
+            os.environ["LANGCHAIN_API_KEY"] = langsmith_api_key
+            os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
+            os.environ["LANGCHAIN_TRACING_V2"] = "true"
+            os.environ["LANGCHAIN_PROJECT"] = "financial-analysis-agent"
+            
+            # Add LangSmith tracer callback with project name
+            callbacks.append(LangChainTracer(project_name="financial-analysis-agent"))
+            
+            # Initialize LangSmith client
+            self.langsmith_client = Client(api_key=langsmith_api_key)
+        else:
+            # Disable tracing
+            os.environ["LANGCHAIN_TRACING_V2"] = "false"
+            self.langsmith_client = None
+        
         self.llm = ChatOpenAI(
             model="gpt-4o",
             temperature=0.1,
-            openai_api_key=openai_api_key
+            openai_api_key=openai_api_key,
+            callbacks=callbacks
         )
         
-        # Initialize tools
-        self.financial_tool = FinancialDataTool()
-        self.comparable_tool = ComparableCompanyTool()
-        self.market_tool = MarketDataTool()
+    def analyze_rankings(self, rankings_data, valuation_method, risk_free_rate=None, market_risk_premium=None):
+        """Generate AI analysis of the rankings"""
         
-        # Initialize LangSmith client
-        if langsmith_api_key:
-            self.langsmith_client = Client(api_key=langsmith_api_key)
+        # Prepare the data for analysis
+        top_companies = rankings_data[:10]  # Top 10 companies
         
-    def create_analysis_graph(self):
-        """Create the LangGraph workflow for financial analysis"""
+        analysis_prompt = f"""
+        Analyze the top 10 companies ranked by {valuation_method}:
         
-        def data_collection_node(state):
-            """Node 1: Collect all financial data"""
-            ticker = state['ticker']
-            duration = state['duration']
-            
-            # Convert duration to yfinance period
-            period_mapping = {
-                "1 Month": "1mo",
-                "3 Months": "3mo", 
-                "6 Months": "6mo",
-                "1 Year": "1y",
-                "2 Years": "2y",
-                "5 Years": "5y"
-            }
-            period = period_mapping.get(duration, "1y")
-            
-            # Collect financial data
-            financial_data = self.financial_tool._run(ticker, period)
-            comparable_data = self.comparable_tool._run(
-                ticker, 
-                financial_data['info'].get('sector', ''), 
-                financial_data['info'].get('marketCap', 0)
-            )
-            market_data = self.market_tool._run(period)
-            
-            state['financial_data'] = financial_data
-            state['comparable_data'] = comparable_data
-            state['market_data'] = market_data
-            state['period'] = period
-            
-            return state
+        Top Companies:
+        """
         
-        def market_price_analysis_node(state):
-            """Node 2: Market Price Method Analysis"""
-            financial_data = state['financial_data']
-            
-            if not financial_data['success']:
-                return {'market_price_analysis': {"error": "Failed to get financial data"}}
-            
-            info = financial_data['info']
-            hist_data = financial_data['historical_data']
-            
-            # Calculate key metrics
-            current_price = hist_data['Close'].iloc[-1]
-            market_cap = info.get('marketCap', 0)
-            book_value = info.get('bookValue', 0)
-            pe_ratio = info.get('trailingPE', 0)
-            pb_ratio = info.get('priceToBook', 0)
-            
-            # Price volatility analysis
-            returns = hist_data['Close'].pct_change().dropna()
-            volatility = returns.std() * np.sqrt(252)  # Annualized
-            
-            # Support and resistance levels
-            high_52w = hist_data['High'].rolling(window=252).max().iloc[-1]
-            low_52w = hist_data['Low'].rolling(window=252).min().iloc[-1]
-            
-            analysis_prompt = f"""
-            Analyze the market price method for {state['ticker']}:
-            
-            Current Price: ${current_price:.2f}
-            Market Cap: ${market_cap:,.0f}
-            Book Value per Share: ${book_value:.2f}
-            P/E Ratio: {pe_ratio:.2f}
-            P/B Ratio: {pb_ratio:.2f}
-            Annualized Volatility: {volatility:.2%}
-            52-Week High: ${high_52w:.2f}
-            52-Week Low: ${low_52w:.2f}
-            
-            Provide detailed analysis using Chain of Thought reasoning:
-            1. Market sentiment analysis
-            2. Valuation ratios interpretation
-            3. Price momentum and technical indicators
-            4. Fair value estimate based on market metrics
-            """
-            
-            response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
-            
-            return {'market_price_analysis': {
-                "analysis": response.content,
-                "metrics": {
-                    "current_price": current_price,
-                    "market_cap": market_cap,
-                    "pe_ratio": pe_ratio,
-                    "pb_ratio": pb_ratio,
-                    "volatility": volatility,
-                    "high_52w": high_52w,
-                    "low_52w": low_52w
-                }
-            }}
+        for company in top_companies:
+            analysis_prompt += f"""
+        {company['rank']}. {company['ticker']} - {company['company_name']} ({company['sector']})
+           Fair Value: ${company['fair_value']/1e9:.2f}B
+           Revenue: ${company['revenue']/1e9:.2f}B
+           Net Income: ${company['net_income']/1e9:.2f}B
+           Book Value: ${company['book_value']/1e9:.2f}B
+        """
         
-        def comparable_analysis_node(state):
-            """Node 3: Comparable Company Analysis"""
-            comparable_data = state['comparable_data']
-            financial_data = state['financial_data']
-            
-            if not comparable_data['success']:
-                return {'comparable_analysis': {"error": "Failed to get comparable data"}}
-            
-            target_info = financial_data['info']
-            comparables = comparable_data['comparables']
-            
-            # Calculate relative metrics
-            comp_metrics = []
-            for ticker, info in comparables.items():
-                comp_metrics.append({
-                    'ticker': ticker,
-                    'pe_ratio': info.get('trailingPE', 0),
-                    'pb_ratio': info.get('priceToBook', 0),
-                    'ev_revenue': info.get('enterpriseToRevenue', 0),
-                    'market_cap': info.get('marketCap', 0),
-                    'roe': info.get('returnOnEquity', 0)
-                })
-            
-            # Calculate averages
-            if comp_metrics:
-                avg_pe = np.mean([m['pe_ratio'] for m in comp_metrics if m['pe_ratio'] > 0])
-                avg_pb = np.mean([m['pb_ratio'] for m in comp_metrics if m['pb_ratio'] > 0])
-                avg_ev_revenue = np.mean([m['ev_revenue'] for m in comp_metrics if m['ev_revenue'] > 0])
-            else:
-                avg_pe = avg_pb = avg_ev_revenue = 0
-            
-            analysis_prompt = f"""
-            Perform comparable company analysis for {state['ticker']}:
-            
-            Target Company Metrics:
-            - P/E Ratio: {target_info.get('trailingPE', 0):.2f}
-            - P/B Ratio: {target_info.get('priceToBook', 0):.2f}
-            - Enterprise Value/Revenue: {target_info.get('enterpriseToRevenue', 0):.2f}
-            
-            Comparable Companies Average:
-            - Average P/E: {avg_pe:.2f}
-            - Average P/B: {avg_pb:.2f}
-            - Average EV/Revenue: {avg_ev_revenue:.2f}
-            
-            Comparable Companies: {list(comparables.keys())}
-            
-            Using Chain of Thought reasoning:
-            1. Analyze relative valuation position
-            2. Identify premium/discount to peers
-            3. Consider qualitative factors (growth, profitability, risk)
-            4. Calculate fair value estimate based on peer multiples
-            """
-            
-            response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
-            
-            return {'comparable_analysis': {
-                "analysis": response.content,
-                "target_metrics": {
-                    "pe_ratio": target_info.get('trailingPE', 0),
-                    "pb_ratio": target_info.get('priceToBook', 0),
-                    "ev_revenue": target_info.get('enterpriseToRevenue', 0)
-                },
-                "peer_averages": {
-                    "avg_pe": avg_pe,
-                    "avg_pb": avg_pb,
-                    "avg_ev_revenue": avg_ev_revenue
-                },
-                "comparables": comp_metrics
-            }}
+        if valuation_method == "Discounted Cash Flow Value":
+            analysis_prompt += f"""
         
-        def dcf_analysis_node(state):
-            """Node 4: Discounted Cash Flow Analysis"""
-            financial_data = state['financial_data']
-            
-            if not financial_data['success']:
-                return {'dcf_analysis': {"error": "Failed to get financial data"}}
-            
-            try:
-                cash_flow = financial_data['cash_flow']
-                info = financial_data['info']
-                
-                # Extract key DCF inputs
-                if not cash_flow.empty and len(cash_flow.columns) > 0:
-                    recent_fcf = cash_flow.loc['Free Cash Flow'].iloc[0] if 'Free Cash Flow' in cash_flow.index else 0
-                    if recent_fcf == 0:
-                        recent_fcf = cash_flow.loc['Total Cash From Operating Activities'].iloc[0] if 'Total Cash From Operating Activities' in cash_flow.index else 0
-                else:
-                    recent_fcf = info.get('freeCashflow', 0)
-                
-                shares_outstanding = info.get('sharesOutstanding', info.get('impliedSharesOutstanding', 1))
-                beta = info.get('beta', 1.0)
-                
-                # WACC calculation
-                risk_free_rate = 0.045  # 10Y Treasury
-                market_risk_premium = 0.06
-                cost_of_equity = risk_free_rate + beta * market_risk_premium
-                
-                analysis_prompt = f"""
-                Perform DCF analysis for {state['ticker']}:
-                
-                Key Inputs:
-                - Most Recent Free Cash Flow: ${recent_fcf:,.0f}
-                - Shares Outstanding: {shares_outstanding:,.0f}
-                - Beta: {beta:.2f}
-                - Cost of Equity (WACC): {cost_of_equity:.2%}
-                - Risk-free Rate: {risk_free_rate:.2%}
-                - Market Risk Premium: {market_risk_premium:.2%}
-                
-                Using Chain of Thought reasoning:
-                1. Project future cash flows (5-year forecast)
-                2. Calculate terminal value
-                3. Discount to present value
-                4. Calculate per-share intrinsic value
-                5. Perform sensitivity analysis on growth and discount rates
-                """
-                
-                response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
-                
-                # Simple DCF calculation for demonstration
-                growth_rate = 0.05  # 5% growth assumption
-                terminal_growth = 0.025  # 2.5% terminal growth
-                
-                # Project 5 years of FCF
-                projected_fcf = []
-                for year in range(1, 6):
-                    projected_fcf.append(recent_fcf * (1 + growth_rate) ** year)
-                
-                # Terminal value
-                terminal_value = projected_fcf[-1] * (1 + terminal_growth) / (cost_of_equity - terminal_growth)
-                
-                # Discount to present value
-                total_pv = sum([fcf / (1 + cost_of_equity) ** (i + 1) for i, fcf in enumerate(projected_fcf)])
-                terminal_pv = terminal_value / (1 + cost_of_equity) ** 5
-                
-                enterprise_value = total_pv + terminal_pv
-                equity_value = enterprise_value  # Simplified - should subtract net debt
-                fair_value_per_share = equity_value / shares_outstanding
-                
-                return {'dcf_analysis': {
-                    "analysis": response.content,
-                    "calculations": {
-                        "recent_fcf": recent_fcf,
-                        "wacc": cost_of_equity,
-                        "projected_fcf": projected_fcf,
-                        "terminal_value": terminal_value,
-                        "enterprise_value": enterprise_value,
-                        "fair_value_per_share": fair_value_per_share
-                    }
-                }}
-                
-            except Exception as e:
-                return {'dcf_analysis': {"error": f"DCF calculation error: {str(e)}"}}
+        Valuation Parameters:
+        - Risk-free Rate: {risk_free_rate:.2%}
+        - Market Risk Premium: {market_risk_premium:.2%}
+        """
         
-        def asset_based_analysis_node(state):
-            """Node 5: Asset-Based Valuation"""
-            financial_data = state['financial_data']
-            
-            if not financial_data['success']:
-                return {'asset_analysis': {"error": "Failed to get financial data"}}
-            
-            try:
-                balance_sheet = financial_data['balance_sheet']
-                info = financial_data['info']
-                
-                if not balance_sheet.empty and len(balance_sheet.columns) > 0:
-                    total_assets = balance_sheet.loc['Total Assets'].iloc[0] if 'Total Assets' in balance_sheet.index else 0
-                    total_liabilities = balance_sheet.loc['Total Liabilities Net Minority Interest'].iloc[0] if 'Total Liabilities Net Minority Interest' in balance_sheet.index else 0
-                    book_value = total_assets - total_liabilities
-                else:
-                    book_value = info.get('totalStockholderEquity', 0)
-                    total_assets = info.get('totalAssets', 0)
-                    total_liabilities = total_assets - book_value
-                
-                shares_outstanding = info.get('sharesOutstanding', info.get('impliedSharesOutstanding', 1))
-                book_value_per_share = book_value / shares_outstanding
-                
-                analysis_prompt = f"""
-                Perform asset-based valuation for {state['ticker']}:
-                
-                Balance Sheet Analysis:
-                - Total Assets: ${total_assets:,.0f}
-                - Total Liabilities: ${total_liabilities:,.0f}
-                - Book Value of Equity: ${book_value:,.0f}
-                - Book Value per Share: ${book_value_per_share:.2f}
-                - Shares Outstanding: {shares_outstanding:,.0f}
-                
-                Using Chain of Thought reasoning:
-                1. Analyze asset quality and composition
-                2. Consider asset revaluation potential
-                3. Evaluate liquidation vs going-concern value
-                4. Compare to market value for value assessment
-                """
-                
-                response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
-                
-                return {'asset_analysis': {
-                    "analysis": response.content,
-                    "metrics": {
-                        "total_assets": total_assets,
-                        "total_liabilities": total_liabilities,
-                        "book_value": book_value,
-                        "book_value_per_share": book_value_per_share,
-                        "shares_outstanding": shares_outstanding
-                    }
-                }}
-                
-            except Exception as e:
-                return {'asset_analysis': {"error": f"Asset analysis error: {str(e)}"}}
+        analysis_prompt += """
         
-        def synthesis_node(state):
-            """Node 6: Synthesize all analyses into final recommendation"""
-            
-            # Collect all analysis results
-            market_analysis = state.get('market_price_analysis', {})
-            comparable_analysis = state.get('comparable_analysis', {})
-            dcf_analysis = state.get('dcf_analysis', {})
-            asset_analysis = state.get('asset_analysis', {})
-            
-            synthesis_prompt = f"""
-            Synthesize comprehensive fair value analysis for {state['ticker']}:
-            
-            MARKET PRICE ANALYSIS:
-            {market_analysis.get('analysis', 'Not available')}
-            
-            COMPARABLE COMPANY ANALYSIS:
-            {comparable_analysis.get('analysis', 'Not available')}
-            
-            DISCOUNTED CASH FLOW ANALYSIS:
-            {dcf_analysis.get('analysis', 'Not available')}
-            
-            ASSET-BASED VALUATION:
-            {asset_analysis.get('analysis', 'Not available')}
-            
-            Using Chain of Thought reasoning:
-            1. Weight each valuation method appropriately
-            2. Consider the reliability and relevance of each approach
-            3. Identify key risks and uncertainties
-            4. Provide final fair value range and recommendation
-            5. Suggest investment thesis (Buy/Hold/Sell with rationale)
-            """
-            
-            response = self.llm.invoke([HumanMessage(content=synthesis_prompt)])
-            
-            return {'final_synthesis': {
-                "comprehensive_analysis": response.content,
-                "timestamp": datetime.now().isoformat()
-            }}
+        Please provide a comprehensive analysis including:
+        1. Key insights about the top-ranked companies
+        2. Sector distribution and trends
+        3. Valuation methodology considerations
+        4. Potential risks and limitations
+        5. Investment implications
+        6. Key assumptions made in the valuation
+        """
         
-
-        # Create the graph
-        graph = StateGraph(AnalysisState)
-        
-        # Add nodes
-        graph.add_node("data_collection", data_collection_node)
-        graph.add_node("market_price_analysis", market_price_analysis_node)
-        graph.add_node("comparable_analysis", comparable_analysis_node)
-        graph.add_node("dcf_analysis", dcf_analysis_node)
-        graph.add_node("asset_analysis", asset_based_analysis_node)
-        graph.add_node("synthesis", synthesis_node)
-        
-        # Add edges
-        graph.add_edge("data_collection", "market_price_analysis")
-        graph.add_edge("data_collection", "comparable_analysis")
-        graph.add_edge("data_collection", "dcf_analysis")
-        graph.add_edge("data_collection", "asset_analysis")
-        
-        graph.add_edge("market_price_analysis", "synthesis")
-        graph.add_edge("comparable_analysis", "synthesis")
-        graph.add_edge("dcf_analysis", "synthesis")
-        graph.add_edge("asset_analysis", "synthesis")
-        
-        graph.add_edge("synthesis", END)
-        
-        # Set entry point
-        graph.set_entry_point("data_collection")
-        
-        return graph.compile()
+        response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
+        return response.content
 
 # Streamlit UI
 def main():
     st.set_page_config(
-        page_title="AI Agentic Financial Analysis System",
+        page_title="FinBot",
         page_icon="📈",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
-    st.title("🤖 AI Agentic Financial Analysis System")
+    st.title("🤖 AI Agentic Financial Bot a.k.a. FinBot")
     st.markdown("*Powered by LangChain, LangGraph, LangSmith & OpenAI*")
     
     # Sidebar for configuration
@@ -581,558 +513,556 @@ def main():
     openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
     langsmith_api_key = st.sidebar.text_input("LangSmith API Key (Optional)", type="password")
     
+    # Enable/disable LangSmith tracing
+    enable_tracing = st.sidebar.checkbox("Enable LangSmith Tracing", value=False, 
+                                       help="Enable this to track analysis in LangSmith (requires API key)")
+    
     if not openai_api_key:
         st.warning("Please enter your OpenAI API key to proceed.")
         st.stop()
     
-    # Analysis Parameters
-    st.sidebar.header("📊 Analysis Parameters")
-    ticker = st.sidebar.text_input("Stock Ticker", value="AAPL", help="Enter US stock ticker (e.g., AAPL, MSFT, GOOGL)")
+    # Load data
+    df = load_sp500_data()
+    if df.empty:
+        st.error("Failed to load S&P 500 financial data.")
+        st.stop()
     
-    duration = st.sidebar.selectbox(
-        "Analysis Duration",
-        ["1 Month", "3 Months", "6 Months", "1 Year", "2 Years", "5 Years"],
-        index=3
-    )
+    # Initialize session state for conversation
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
     
-    analysis_depth = st.sidebar.selectbox(
-        "Analysis Depth",
-        ["Quick Overview", "Standard Analysis", "Comprehensive Deep-Dive"],
-        index=2
-    )
+    if 'current_step' not in st.session_state:
+        st.session_state.current_step = 'welcome'
     
-    # Advanced parameters
-    st.sidebar.subheader("Advanced Parameters")
-    risk_free_rate = st.sidebar.slider("Risk-free Rate (%)", 0.0, 10.0, 4.5, 0.1) / 100
-    market_risk_premium = st.sidebar.slider("Market Risk Premium (%)", 0.0, 15.0, 6.0, 0.1) / 100
+    if 'valuation_method' not in st.session_state:
+        st.session_state.valuation_method = None
     
-    # Analysis button
-    if st.sidebar.button("🚀 Start Analysis", type="primary"):
-        if ticker:
-            # Initialize the agent
-            with st.spinner("Initializing AI Financial Analysis Agent..."):
-                agent = FinancialAnalysisAgent(openai_api_key, langsmith_api_key)
-                analysis_graph = agent.create_analysis_graph()
-            
-            # Create analysis parameters
-            params = AnalysisParameters(
-                ticker=ticker.upper(),
-                duration=duration,
-                analysis_depth=analysis_depth.lower(),
-                risk_free_rate=risk_free_rate,
-                market_risk_premium=market_risk_premium
-            )
-            
-            # Initialize state
-            initial_state = {
-                "ticker": params.ticker,
-                "duration": params.duration,
-                "risk_free_rate": params.risk_free_rate,
-                "market_risk_premium": params.market_risk_premium
-            }
-            
-            # Progress tracking
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # Run the analysis
-            try:
-                status_text.text("🔍 Collecting financial data...")
-                progress_bar.progress(20)
-                
-                # Execute the graph
-                result = analysis_graph.invoke(initial_state)
-                
-                progress_bar.progress(100)
-                status_text.text("✅ Analysis Complete!")
-                
-                # Display results
-                display_analysis_results(result, params)
-                
-            except Exception as e:
-                st.error(f"Analysis failed: {str(e)}")
-                st.exception(e)
-        else:
-            st.sidebar.error("Please enter a stock ticker.")
-
-def display_analysis_results(result: Dict[str, Any], params: AnalysisParameters):
-    """Display comprehensive analysis results"""
+    if 'risk_free_rate' not in st.session_state:
+        st.session_state.risk_free_rate = None
     
-    ticker = params.ticker
+    if 'market_risk_premium' not in st.session_state:
+        st.session_state.market_risk_premium = None
     
-    # Header with stock info
-    if 'financial_data' in result and result['financial_data']['success']:
-        info = result['financial_data']['info']
-        col1, col2, col3, col4 = st.columns(4)
+    if 'rankings' not in st.session_state:
+        st.session_state.rankings = None
+    
+    if 'show_confirmation' not in st.session_state:
+        st.session_state.show_confirmation = False
+    
+    if 'ai_analysis' not in st.session_state:
+        st.session_state.ai_analysis = None
+    
+    # Display chat interface
+    st.header("💬 Chat with AI Financial Analyst")
+    
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask me about company rankings..."):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
         
-        with col1:
-            st.metric("Company", info.get('shortName', ticker))
-        with col2:
-            current_price = info.get('currentPrice', 0)
-            st.metric("Current Price", f"${current_price:.2f}")
-        with col3:
-            market_cap = info.get('marketCap', 0)
-            st.metric("Market Cap", f"${market_cap/1e9:.2f}B")
-        with col4:
-            pe_ratio = info.get('trailingPE', 0)
-            st.metric("P/E Ratio", f"{pe_ratio:.2f}")
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Show thinking UI
+        with st.chat_message("assistant"):
+            # Determine the type of processing needed
+            prompt_lower = prompt.lower()
+            is_general = is_general_question(prompt_lower)
+            
+            if is_general:
+                # For general questions, show AI thinking with stages
+                thinking_container = st.container()
+                with thinking_container:
+                    # Stage 1: Understanding the question
+                    with st.spinner("🧠 Understanding your question..."):
+                        time.sleep(0.6)
+                    
+                    # Stage 2: Searching knowledge base
+                    with st.spinner("🔍 Searching knowledge base..."):
+                        time.sleep(0.4)
+                    
+                    # Stage 3: Generating response
+                    with st.spinner("✍️ Generating comprehensive response..."):
+                        time.sleep(0.3)
+                        
+                        # Process the message
+                        response = process_user_input(prompt, df, openai_api_key, langsmith_api_key if enable_tracing else None)
+                        st.markdown(response)
+                        st.session_state.messages.append({"role": "assistant", "content": response})
+            else:
+                # For ranking requests, show processing stages
+                thinking_container = st.container()
+                with thinking_container:
+                    # Stage 1: Analyzing request
+                    with st.spinner("📊 Analyzing your request..."):
+                        time.sleep(0.4)
+                    
+                    # Stage 2: Processing
+                    with st.spinner("⚙️ Processing parameters..."):
+                        time.sleep(0.3)
+                        
+                        # Process the message
+                        response = process_user_input(prompt, df, openai_api_key, langsmith_api_key if enable_tracing else None)
+                        st.markdown(response)
+                        st.session_state.messages.append({"role": "assistant", "content": response})
     
-    # Create tabs for different analyses
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 Overview", "💰 Market Price", "🔍 Comparables", 
-        "💸 DCF Analysis", "🏢 Asset-Based", "🎯 Final Synthesis"
-    ])
+    # Display current step guidance
+    if st.session_state.current_step == 'welcome':
+        st.info("💡 **You can ask me about:**\n• Company rankings: 'I want to see company rankings based on fair market value'\n• General questions: 'Who is the CEO of Apple?' or 'What is DCF valuation?'\n• Financial concepts: 'Explain P/E ratio' or 'What is market cap?'")
+    elif st.session_state.current_step == 'select_valuation':
+        st.info("💡 **Please select a valuation method:** Asset Based Value, Discounted Cash Flow Value, or Comparable Company Analysis")
+    elif st.session_state.current_step == 'dcf_parameters':
+        st.info("💡 **For DCF analysis, please provide:** Risk-free rate (e.g., 4.5%) and Market Risk Premium (e.g., 6%)")
+    elif st.session_state.current_step == 'show_results':
+        st.info("💡 **Analysis complete!** You can ask for more details, start a new analysis, or ask general questions about companies and finance.")
     
-    with tab1:
-        st.header("📊 Analysis Overview")
-        display_overview_charts(result, params)
+    # Show parameter confirmation if needed
+    if st.session_state.show_confirmation:
+        st.divider()
+        show_calculation_example(
+            st.session_state.valuation_method, 
+            st.session_state.risk_free_rate, 
+            st.session_state.market_risk_premium
+        )
+        
+        if show_parameter_confirmation(
+            st.session_state.valuation_method, 
+            st.session_state.risk_free_rate, 
+            st.session_state.market_risk_premium
+        ):
+            # Start calculations
+            st.session_state.show_confirmation = False
+            st.session_state.current_step = 'calculating'
+            
+            # Calculate rankings with progress and thinking UI
+            with st.spinner("🔢 Calculating valuations for 503 companies..."):
+                rankings = calculate_rankings(
+                    df, 
+                    st.session_state.valuation_method, 
+                    st.session_state.risk_free_rate, 
+                    st.session_state.market_risk_premium
+                )
+            
+            st.session_state.rankings = rankings
+            st.session_state.current_step = 'show_results'
+            
+            # Generate AI analysis with thinking UI
+            with st.spinner("🤖 AI is analyzing the rankings and generating insights..."):
+                agent = FinancialAnalysisAgent(openai_api_key, langsmith_api_key if enable_tracing else None)
+                analysis = agent.analyze_rankings(
+                    rankings, 
+                    st.session_state.valuation_method, 
+                    st.session_state.risk_free_rate, 
+                    st.session_state.market_risk_premium
+                )
+                
+                st.session_state.ai_analysis = analysis
     
-    with tab2:
-        st.header("💰 Market Price Method Analysis")
-        if 'market_price_analysis' in result:
-            display_market_price_analysis(result['market_price_analysis'], result)
-    
-    with tab3:
-        st.header("🔍 Comparable Company Analysis")
-        if 'comparable_analysis' in result:
-            display_comparable_analysis(result['comparable_analysis'])
-    
-    with tab4:
-        st.header("💸 Discounted Cash Flow Analysis")
-        if 'dcf_analysis' in result:
-            display_dcf_analysis(result['dcf_analysis'])
-    
-    with tab5:
-        st.header("🏢 Asset-Based Valuation")
-        if 'asset_analysis' in result:
-            display_asset_analysis(result['asset_analysis'])
-    
-    with tab6:
-        st.header("🎯 Final Synthesis & Recommendation")
-        if 'final_synthesis' in result:
-            display_final_synthesis(result['final_synthesis'])
+    # Display results if available
+    if st.session_state.rankings is not None and st.session_state.current_step == 'show_results':
+        with st.container(key="rankings_results_container"):
+            display_rankings_results(st.session_state.rankings, st.session_state.valuation_method)
+        
+        # Display AI analysis if available
+        if st.session_state.ai_analysis is not None:
+            st.subheader("🤖 AI Analysis")
+            st.markdown(st.session_state.ai_analysis)
 
-def display_overview_charts(result: Dict[str, Any], params: AnalysisParameters):
-    """Display overview charts and key metrics"""
+def process_user_input(prompt, df, openai_api_key, langsmith_api_key):
+    """Process user input and generate appropriate response"""
     
-    if 'financial_data' not in result or not result['financial_data']['success']:
-        st.error("Failed to load financial data for overview charts.")
-        return
+    prompt_lower = prompt.lower()
     
-    hist_data = result['financial_data']['historical_data']
-    info = result['financial_data']['info']
+    # Check if this is a general question (not about rankings)
+    if is_general_question(prompt_lower):
+        return answer_general_question(prompt, openai_api_key, langsmith_api_key)
     
-    # Price chart with volume
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.1,
-        subplot_titles=('Stock Price', 'Volume'),
-        row_width=[0.7, 0.3]
+    # Welcome step - user wants to see rankings
+    if st.session_state.current_step == 'welcome':
+        if any(keyword in prompt_lower for keyword in ['rank', 'ranking', 'fair market value', 'company']):
+            st.session_state.current_step = 'select_valuation'
+            return """
+I'd be happy to help you rank companies based on fair market value! 
+
+I can calculate rankings using three different valuation methods:
+
+1. **Asset Based Value** - Based on tangible book value and asset quality
+2. **Discounted Cash Flow Value** - Based on projected future cash flows (requires macroeconomic parameters)
+3. **Comparable Company Analysis** - Based on industry multiples and peer comparisons
+
+Which valuation method would you prefer to use?
+"""
+    
+    # Select valuation method step
+    elif st.session_state.current_step == 'select_valuation':
+        if 'asset' in prompt_lower and 'based' in prompt_lower:
+            st.session_state.valuation_method = "Asset Based Value"
+            st.session_state.show_confirmation = True
+            return """
+Great choice! I'll use the Asset Based Value method.
+
+Let me show you how this calculation works and confirm the parameters before we start analyzing all 503 companies.
+"""
+        
+        elif 'dcf' in prompt_lower or 'discounted' in prompt_lower or 'cash flow' in prompt_lower:
+            st.session_state.valuation_method = "Discounted Cash Flow Value"
+            st.session_state.current_step = 'dcf_parameters'
+            return """
+Great choice! For Discounted Cash Flow analysis, I need some macroeconomic parameters to calculate the discount rate.
+
+Please provide:
+1. **Risk-free rate** (e.g., 4.5% for current 10-year Treasury)
+2. **Market Risk Premium** (e.g., 6% for typical equity risk premium)
+
+You can provide these as percentages (e.g., "4.5% and 6%") or as decimals (e.g., "0.045 and 0.06").
+"""
+        
+        elif 'comparable' in prompt_lower or 'peer' in prompt_lower or 'multiple' in prompt_lower:
+            st.session_state.valuation_method = "Comparable Company Analysis"
+            st.session_state.show_confirmation = True
+            return """
+Excellent choice! I'll use the Comparable Company Analysis method.
+
+Let me show you how this calculation works and confirm the parameters before we start analyzing all 503 companies.
+"""
+        
+        else:
+            return """
+I didn't quite understand your choice. Please specify one of these valuation methods:
+
+- **Asset Based Value** - For asset-based valuation
+- **Discounted Cash Flow Value** - For DCF analysis (requires additional parameters)
+- **Comparable Company Analysis** - For peer-based valuation
+"""
+    
+    # DCF parameters step
+    elif st.session_state.current_step == 'dcf_parameters':
+        # Extract numbers from the prompt
+        import re
+        numbers = re.findall(r'\d+\.?\d*', prompt)
+        
+        if len(numbers) >= 2:
+            try:
+                # Convert to float and handle percentage signs
+                if '%' in prompt:
+                    risk_free_rate = float(numbers[0]) / 100
+                    market_risk_premium = float(numbers[1]) / 100
+                else:
+                    risk_free_rate = float(numbers[0])
+                    market_risk_premium = float(numbers[1])
+                
+                st.session_state.risk_free_rate = risk_free_rate
+                st.session_state.market_risk_premium = market_risk_premium
+                st.session_state.show_confirmation = True
+                
+                return f"""
+Perfect! I have your parameters:
+- Risk-free Rate: {risk_free_rate:.2%}
+- Market Risk Premium: {market_risk_premium:.2%}
+
+Let me show you how the DCF calculation works and confirm everything before we start analyzing all 503 companies.
+"""
+            except ValueError:
+                return "I couldn't parse the numbers correctly. Please provide the risk-free rate and market risk premium as percentages (e.g., '4.5% and 6%') or decimals (e.g., '0.045 and 0.06')."
+        else:
+            return "I need two numbers: the risk-free rate and market risk premium. Please provide them as percentages (e.g., '4.5% and 6%') or decimals (e.g., '0.045 and 0.06')."
+    
+    # Show results step - handle follow-up questions
+    elif st.session_state.current_step == 'show_results':
+        if any(keyword in prompt_lower for keyword in ['new', 'start over', 'reset', 'another']):
+            # Reset to welcome
+            st.session_state.current_step = 'welcome'
+            st.session_state.valuation_method = None
+            st.session_state.risk_free_rate = None
+            st.session_state.market_risk_premium = None
+            st.session_state.rankings = None
+            st.session_state.show_confirmation = False
+            st.session_state.ai_analysis = None
+            return "Sure! Let's start over. What would you like to analyze?"
+        
+        elif any(keyword in prompt_lower for keyword in ['assumption', 'method', 'how', 'calculate']):
+            return explain_valuation_method(st.session_state.valuation_method)
+        
+        elif any(keyword in prompt_lower for keyword in ['sector', 'industry', 'top']):
+            return analyze_sector_distribution(st.session_state.rankings)
+        
+        else:
+            return "I can help you with:\n- Starting a new analysis\n- Explaining the valuation method and assumptions\n- Analyzing sector distribution\n- Or any other questions about the rankings!"
+    
+    # Default response
+    return "I'm here to help you with financial analysis! You can:\n\n• **Ask for company rankings**: 'I want to see company rankings based on fair market value'\n• **Ask general questions**: 'Who is the CEO of Apple?' or 'What is DCF valuation?'\n• **Learn about finance**: 'Explain P/E ratio' or 'What is market cap?'\n\nWhat would you like to know?"
+
+def is_general_question(prompt_lower):
+    """Determine if the user is asking a general question rather than requesting rankings"""
+    
+    # First, check for ranking-specific keywords that should NOT be treated as general questions
+    ranking_keywords = [
+        'rank', 'ranking', 'rankings', 'ranked',
+        'fair market value', 'market value',
+        'asset based', 'asset-based',
+        'comparable company', 'comparable analysis',
+        'valuation method', 'valuation methods'
+    ]
+    
+    # If the prompt contains ranking keywords, it's not a general question
+    for keyword in ranking_keywords:
+        if keyword in prompt_lower:
+            return False
+    
+    # Keywords that indicate general questions (but not ranking requests)
+    general_keywords = [
+        'who is', 'what is', 'when', 'where', 'why', 'how',
+        'ceo', 'founder', 'president', 'executive', 'director',
+        'founded', 'established', 'created', 'started',
+        'headquarters', 'location', 'address', 'city', 'country',
+        'industry', 'sector', 'business', 'company', 'corporation',
+        'revenue', 'profit', 'earnings', 'sales', 'market cap',
+        'stock price', 'share price', 'trading', 'exchange',
+        'dividend', 'payout', 'yield', 'ratio', 'multiple',
+        'valuation', 'worth', 'value', 'price',
+        'competitor', 'rival', 'peer', 'similar',
+        'product', 'service', 'brand', 'technology',
+        'financial', 'accounting', 'investment', 'trading',
+        'explain', 'define', 'describe', 'tell me about',
+        'difference between', 'compare', 'versus', 'vs',
+        'example', 'instance', 'case study'
+    ]
+    
+    # Check if any general keywords are present
+    for keyword in general_keywords:
+        if keyword in prompt_lower:
+            return True
+    
+    # Check for specific question patterns
+    question_patterns = [
+        'who is the ceo of',
+        'who founded',
+        'what does',
+        'how does',
+        'when was',
+        'where is',
+        'why is',
+        'explain',
+        'define',
+        'describe',
+        'tell me about'
+    ]
+    
+    for pattern in question_patterns:
+        if pattern in prompt_lower:
+            return True
+    
+    return False
+
+def answer_general_question(question, openai_api_key, langsmith_api_key):
+    """Answer general questions using the LLM"""
+    
+    try:
+        # Initialize the AI agent
+        agent = FinancialAnalysisAgent(openai_api_key, langsmith_api_key)
+        
+        # Create a context-aware prompt for financial and business questions
+        system_prompt = """You are an expert financial analyst and business intelligence assistant. You have deep knowledge of:
+
+1. **Company Information**: CEOs, founders, executives, headquarters, history, business models
+2. **Financial Concepts**: Valuation methods, ratios, metrics, investment strategies
+3. **Market Analysis**: Industry trends, competitive landscapes, market dynamics
+4. **Investment Topics**: Stocks, bonds, ETFs, mutual funds, portfolio management
+5. **Business Strategy**: Corporate governance, mergers & acquisitions, strategic initiatives
+
+Provide accurate, informative, and helpful responses. When discussing companies, include relevant financial context when appropriate. Be conversational but professional. If you're not certain about specific current information (like exact numbers or recent changes), acknowledge this and provide the most recent information you have.
+
+Format your responses clearly with bullet points, sections, and emojis when appropriate to make them easy to read."""
+        
+        # Create the full prompt
+        full_prompt = f"""
+{system_prompt}
+
+User Question: {question}
+
+Please provide a comprehensive and helpful response. If this is about a specific company, include relevant financial context when possible.
+"""
+        
+        # Get response from LLM with thinking indicators
+        response = agent.llm.invoke([HumanMessage(content=full_prompt)])
+        
+        return response.content
+        
+    except Exception as e:
+        return f"I apologize, but I encountered an error while processing your question: {str(e)}. Please try rephrasing your question or ask about company rankings instead."
+
+def display_rankings_results(rankings, valuation_method):
+    """Display rankings in a nice format"""
+    
+    st.header("📈 Rankings Results")
+    
+    # Create DataFrame for display
+    df_display = pd.DataFrame(rankings)
+    df_display['Fair Value (B)'] = df_display['fair_value'] / 1e9
+    df_display['Revenue (B)'] = df_display['revenue'] / 1e9
+    df_display['Net Income (B)'] = df_display['net_income'] / 1e9
+    
+    # Display top 20 companies
+    st.subheader(f"Top 20 Companies by {valuation_method}")
+    
+    display_cols = ['rank', 'ticker', 'company_name', 'sector', 'Fair Value (B)', 'Revenue (B)', 'Net Income (B)']
+    st.dataframe(
+        df_display[display_cols].head(20),
+        column_config={
+            "rank": st.column_config.NumberColumn("Rank", format="%d"),
+            "ticker": st.column_config.TextColumn("Ticker"),
+            "company_name": st.column_config.TextColumn("Company"),
+            "sector": st.column_config.TextColumn("Sector"),
+            "Fair Value (B)": st.column_config.NumberColumn("Fair Value ($B)", format="%.2f"),
+            "Revenue (B)": st.column_config.NumberColumn("Revenue ($B)", format="%.2f"),
+            "Net Income (B)": st.column_config.NumberColumn("Net Income ($B)", format="%.2f"),
+        },
+        hide_index=True
     )
     
-    # Price chart
-    fig.add_trace(
-        go.Candlestick(
-            x=hist_data.index,
-            open=hist_data['Open'],
-            high=hist_data['High'],
-            low=hist_data['Low'],
-            close=hist_data['Close'],
-            name='Price'
-        ),
-        row=1, col=1
-    )
-    
-    # Volume chart
-    fig.add_trace(
-        go.Bar(
-            x=hist_data.index,
-            y=hist_data['Volume'],
-            name='Volume',
-            marker_color='rgba(158,202,225,0.8)'
-        ),
-        row=2, col=1
-    )
-    
-    fig.update_layout(
-        title=f"{params.ticker} - Stock Price and Volume ({params.duration})",
-        xaxis_rangeslider_visible=False,
-        height=600
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Key financial metrics summary
+    # Create visualizations
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("📈 Performance Metrics")
-        
-        # Calculate returns
-        returns = hist_data['Close'].pct_change().dropna()
-        total_return = (hist_data['Close'].iloc[-1] / hist_data['Close'].iloc[0] - 1) * 100
-        volatility = returns.std() * np.sqrt(252) * 100
-        
-        metrics_data = {
-            'Metric': ['Total Return', 'Annualized Volatility', 'Sharpe Ratio', 'Max Drawdown'],
-            'Value': [
-                f"{total_return:.2f}%",
-                f"{volatility:.2f}%",
-                f"{(returns.mean() / returns.std() * np.sqrt(252)):.2f}",
-                f"{((hist_data['Close'] / hist_data['Close'].cummax() - 1).min() * 100):.2f}%"
-            ]
-        }
-        
-        st.dataframe(pd.DataFrame(metrics_data), hide_index=True)
+        # Sector distribution
+        sector_counts = df_display.head(20)['sector'].value_counts()
+        fig = px.pie(
+            values=sector_counts.values, 
+            names=sector_counts.index, 
+            title="Sector Distribution (Top 20)"
+        )
+        st.plotly_chart(fig, use_container_width=True, key="sector_distribution")
     
     with col2:
-        st.subheader("🏢 Company Fundamentals")
-        
-        fundamentals_data = {
-            'Metric': ['Sector', 'Industry', 'Employees', 'Beta', 'Forward P/E'],
-            'Value': [
-                info.get('sector', 'N/A'),
-                info.get('industry', 'N/A')[:30] + '...' if len(info.get('industry', '')) > 30 else info.get('industry', 'N/A'),
-                f"{info.get('fullTimeEmployees', 0):,}",
-                f"{info.get('beta', 0):.2f}",
-                f"{info.get('forwardPE', 0):.2f}"
-            ]
-        }
-        
-        st.dataframe(pd.DataFrame(fundamentals_data), hide_index=True)
-
-def display_market_price_analysis(analysis: Dict[str, Any], result: Dict[str, Any]):
-    """Display market price method analysis"""
-    
-    if 'error' in analysis:
-        st.error(f"Market Price Analysis Error: {analysis['error']}")
-        return
-    
-    # Display the AI analysis
-    st.subheader("🤖 AI Analysis (Chain of Thought)")
-    st.markdown(analysis['analysis'])
-    
-    # Display key metrics
-    if 'metrics' in analysis:
-        metrics = analysis['metrics']
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Current Price", f"${metrics['current_price']:.2f}")
-            st.metric("P/E Ratio", f"{metrics['pe_ratio']:.2f}")
-        
-        with col2:
-            st.metric("P/B Ratio", f"{metrics['pb_ratio']:.2f}")
-            st.metric("Volatility", f"{metrics['volatility']:.2%}")
-        
-        with col3:
-            st.metric("52W High", f"${metrics['high_52w']:.2f}")
-            st.metric("52W Low", f"${metrics['low_52w']:.2f}")
-        
-        # Price range visualization
-        fig = go.Figure()
-        
-        current_price = metrics['current_price']
-        high_52w = metrics['high_52w']
-        low_52w = metrics['low_52w']
-        
-        fig.add_trace(go.Indicator(
-            mode="gauge+number",
-            value=current_price,
-            domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Price Position in 52W Range"},
-            gauge={
-                'axis': {'range': [low_52w * 0.9, high_52w * 1.1]},
-                'bar': {'color': "darkblue"},
-                'steps': [
-                    {'range': [low_52w * 0.9, low_52w], 'color': "lightgray"},
-                    {'range': [high_52w, high_52w * 1.1], 'color': "lightgray"}
-                ],
-                'threshold': {
-                    'line': {'color': "red", 'width': 4},
-                    'thickness': 0.75,
-                    'value': current_price
-                }
-            }
-        ))
-        
-        fig.update_layout(height=300)
-        st.plotly_chart(fig, use_container_width=True)
-
-def display_comparable_analysis(analysis: Dict[str, Any]):
-    """Display comparable company analysis"""
-    
-    if 'error' in analysis:
-        st.error(f"Comparable Analysis Error: {analysis['error']}")
-        return
-    
-    # Display the AI analysis
-    st.subheader("🤖 AI Analysis (Chain of Thought)")
-    st.markdown(analysis['analysis'])
-    
-    if 'target_metrics' in analysis and 'peer_averages' in analysis:
-        # Comparison metrics
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("🎯 Target Company")
-            target = analysis['target_metrics']
-            st.metric("P/E Ratio", f"{target['pe_ratio']:.2f}")
-            st.metric("P/B Ratio", f"{target['pb_ratio']:.2f}")
-            st.metric("EV/Revenue", f"{target['ev_revenue']:.2f}")
-        
-        with col2:
-            st.subheader("👥 Peer Average")
-            peers = analysis['peer_averages']
-            st.metric("P/E Ratio", f"{peers['avg_pe']:.2f}")
-            st.metric("P/B Ratio", f"{peers['avg_pb']:.2f}")
-            st.metric("EV/Revenue", f"{peers['avg_ev_revenue']:.2f}")
-        
-        # Comparative visualization
-        if 'comparables' in analysis:
-            comp_df = pd.DataFrame(analysis['comparables'])
-            
-            if not comp_df.empty:
-                fig = make_subplots(
-                    rows=1, cols=3,
-                    subplot_titles=('P/E Ratio', 'P/B Ratio', 'EV/Revenue')
-                )
-                
-                # P/E comparison
-                fig.add_trace(
-                    go.Bar(x=comp_df['ticker'], y=comp_df['pe_ratio'], name='P/E'),
-                    row=1, col=1
-                )
-                
-                # P/B comparison
-                fig.add_trace(
-                    go.Bar(x=comp_df['ticker'], y=comp_df['pb_ratio'], name='P/B'),
-                    row=1, col=2
-                )
-                
-                # EV/Revenue comparison
-                fig.add_trace(
-                    go.Bar(x=comp_df['ticker'], y=comp_df['ev_revenue'], name='EV/Rev'),
-                    row=1, col=3
-                )
-                
-                fig.update_layout(
-                    title="Valuation Multiples Comparison",
-                    showlegend=False,
-                    height=400
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-
-def display_dcf_analysis(analysis: Dict[str, Any]):
-    """Display DCF analysis"""
-    
-    if 'error' in analysis:
-        st.error(f"DCF Analysis Error: {analysis['error']}")
-        return
-    
-    # Display the AI analysis
-    st.subheader("🤖 AI Analysis (Chain of Thought)")
-    st.markdown(analysis['analysis'])
-    
-    if 'calculations' in analysis:
-        calc = analysis['calculations']
-        
-        # Key DCF metrics
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Recent FCF", f"${calc['recent_fcf']/1e6:.0f}M")
-            st.metric("WACC", f"{calc['wacc']:.2%}")
-        
-        with col2:
-            st.metric("Enterprise Value", f"${calc['enterprise_value']/1e9:.2f}B")
-            st.metric("Terminal Value", f"${calc['terminal_value']/1e9:.2f}B")
-        
-        with col3:
-            st.metric("Fair Value/Share", f"${calc['fair_value_per_share']:.2f}", 
-                     help="Intrinsic value based on DCF model")
-        
-        # Cash flow projection chart
-        years = list(range(1, 6))
-        projected_fcf = [fcf/1e6 for fcf in calc['projected_fcf']]  # Convert to millions
-        
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=years,
-            y=projected_fcf,
-            name='Projected FCF',
-            marker_color='lightblue'
-        ))
-        
-        fig.update_layout(
-            title="Projected Free Cash Flow (5-Year)",
-            xaxis_title="Year",
-            yaxis_title="Free Cash Flow ($M)",
-            height=400
+        # Fair value vs revenue scatter
+        fig = px.scatter(
+            df_display.head(20),
+            x='Revenue (B)',
+            y='Fair Value (B)',
+            hover_data=['ticker', 'company_name'],
+            title="Fair Value vs Revenue (Top 20)"
         )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Sensitivity analysis
-        st.subheader("📊 Sensitivity Analysis")
-        
-        # Create sensitivity table
-        growth_rates = [0.02, 0.03, 0.05, 0.07, 0.10]
-        discount_rates = [0.08, 0.09, 0.10, 0.11, 0.12]
-        
-        base_fcf = calc['recent_fcf']
-        
-        sensitivity_data = []
-        for discount_rate in discount_rates:
-            row = []
-            for growth_rate in growth_rates:
-                # Simplified sensitivity calculation
-                terminal_growth = 0.025
-                projected_fcf_sens = [base_fcf * (1 + growth_rate) ** year for year in range(1, 6)]
-                terminal_value_sens = projected_fcf_sens[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
-                total_pv_sens = sum([fcf / (1 + discount_rate) ** (i + 1) for i, fcf in enumerate(projected_fcf_sens)])
-                terminal_pv_sens = terminal_value_sens / (1 + discount_rate) ** 5
-                enterprise_value_sens = total_pv_sens + terminal_pv_sens
-                
-                row.append(enterprise_value_sens / 1e9)  # Convert to billions
-            sensitivity_data.append(row)
-        
-        sensitivity_df = pd.DataFrame(
-            sensitivity_data,
-            index=[f"{dr:.1%}" for dr in discount_rates],
-            columns=[f"{gr:.1%}" for gr in growth_rates]
-        )
-        
-        fig = go.Figure(data=go.Heatmap(
-            z=sensitivity_df.values,
-            x=sensitivity_df.columns,
-            y=sensitivity_df.index,
-            colorscale='RdYlGn',
-            text=sensitivity_df.values,
-            texttemplate="%{text:.1f}B",
-            textfont={"size": 10},
-        ))
-        
-        fig.update_layout(
-            title="Enterprise Value Sensitivity (Growth Rate vs Discount Rate)",
-            xaxis_title="Growth Rate",
-            yaxis_title="Discount Rate",
-            height=400
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="fair_value_scatter")
 
-def display_asset_analysis(analysis: Dict[str, Any]):
-    """Display asset-based valuation analysis"""
+def explain_valuation_method(method):
+    """Explain the valuation method and assumptions"""
     
-    if 'error' in analysis:
-        st.error(f"Asset Analysis Error: {analysis['error']}")
-        return
-    
-    # Display the AI analysis
-    st.subheader("🤖 AI Analysis (Chain of Thought)")
-    st.markdown(analysis['analysis'])
-    
-    if 'metrics' in analysis:
-        metrics = analysis['metrics']
-        
-        # Key asset metrics
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Total Assets", f"${metrics['total_assets']/1e9:.2f}B")
-            st.metric("Book Value/Share", f"${metrics['book_value_per_share']:.2f}")
-        
-        with col2:
-            st.metric("Total Liabilities", f"${metrics['total_liabilities']/1e9:.2f}B")
-            st.metric("Shares Outstanding", f"{metrics['shares_outstanding']/1e6:.0f}M")
-        
-        with col3:
-            st.metric("Book Value", f"${metrics['book_value']/1e9:.2f}B")
-            debt_to_assets = metrics['total_liabilities'] / metrics['total_assets'] if metrics['total_assets'] > 0 else 0
-            st.metric("Debt-to-Assets", f"{debt_to_assets:.2%}")
-        
-        # Balance sheet visualization
-        fig = go.Figure(data=[
-            go.Bar(name='Assets', x=['Balance Sheet'], y=[metrics['total_assets']/1e9]),
-            go.Bar(name='Liabilities', x=['Balance Sheet'], y=[metrics['total_liabilities']/1e9]),
-            go.Bar(name='Equity', x=['Balance Sheet'], y=[metrics['book_value']/1e9])
-        ])
-        
-        fig.update_layout(
-            title="Balance Sheet Breakdown",
-            xaxis_title="",
-            yaxis_title="Value ($B)",
-            barmode='group',
-            height=400
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+    explanations = {
+        "Asset Based Value": """
+## 🏢 Asset Based Value Method
 
-def display_final_synthesis(synthesis: Dict[str, Any]):
-    """Display final synthesis and recommendation"""
-    
-    st.subheader("🤖 Comprehensive AI Analysis & Recommendation")
-    st.markdown(synthesis['comprehensive_analysis'])
-    
-    # Analysis timestamp
-    timestamp = synthesis.get('timestamp', datetime.now().isoformat())
-    st.caption(f"Analysis completed: {timestamp}")
-    
-    # Create summary box
-    st.info("💡 **Investment Thesis Summary**: The AI agent has analyzed this company using four distinct valuation methodologies, providing a comprehensive view of its fair value from multiple perspectives.")
+**How it works:**
+- Calculates tangible book value (Total Assets - Total Liabilities - Intangible Assets - Goodwill)
+- Uses conservative estimates to account for asset quality
+- Applies an 80% discount to book value as a safety margin
 
-# Additional utility functions
-def create_charts_and_visualizations(result: Dict[str, Any]):
-    """Create additional charts and visualizations"""
+**Key Assumptions:**
+- Tangible assets are more reliable than intangible assets
+- Conservative approach to account for potential asset write-downs
+- Suitable for asset-heavy businesses (utilities, real estate, manufacturing)
+
+**Limitations:**
+- May undervalue companies with strong intangible assets (brands, patents)
+- Doesn't account for future earnings potential
+- Less suitable for high-growth technology companies
+""",
+        
+        "Discounted Cash Flow Value": """
+## 💰 Discounted Cash Flow (DCF) Method
+
+**How it works:**
+- Projects future free cash flows for 5 years
+- Calculates terminal value using perpetual growth model
+- Discounts all cash flows to present value using WACC
+
+**Key Assumptions:**
+- 5% annual growth rate for first 5 years
+- 2.5% terminal growth rate
+- Beta of 1.0 (market average)
+- WACC = Risk-free rate + Market risk premium
+
+**Growth Projections:**
+- Year 1-5: 5% annual growth
+- Terminal: 2.5% perpetual growth
+- Conservative estimates to account for uncertainty
+
+**Limitations:**
+- Highly sensitive to growth and discount rate assumptions
+- Requires reliable cash flow projections
+- May not capture cyclical or seasonal variations
+""",
+        
+        "Comparable Company Analysis": """
+## 🔍 Comparable Company Analysis
+
+**How it works:**
+- Uses industry average multiples to value companies
+- Combines EV/Revenue, P/E, and P/B ratios
+- Averages multiple approaches for balanced valuation
+
+**Key Assumptions:**
+- EV/Revenue multiple: 2.0x
+- P/E multiple: 15.0x
+- P/B multiple: 1.5x
+- Industry averages based on conservative estimates
+
+**Valuation Formula:**
+Fair Value = (EV/Revenue Value + P/E Value + P/B Value) / 3
+
+**Limitations:**
+- Assumes companies are comparable within sectors
+- Uses simplified industry averages
+- May not account for company-specific factors
+- Market multiples can be volatile
+"""
+    }
     
-    if 'financial_data' not in result or not result['financial_data']['success']:
-        return
+    return explanations.get(method, "Valuation method explanation not available.")
+
+def analyze_sector_distribution(rankings):
+    """Analyze sector distribution of rankings"""
     
-    hist_data = result['financial_data']['historical_data']
+    if not rankings:
+        return "No rankings data available for sector analysis."
     
-    # Technical indicators
-    st.subheader("📈 Technical Analysis")
+    df_analysis = pd.DataFrame(rankings)
     
-    # Calculate moving averages
-    hist_data['MA20'] = hist_data['Close'].rolling(window=20).mean()
-    hist_data['MA50'] = hist_data['Close'].rolling(window=50).mean()
+    # Sector analysis
+    sector_counts = df_analysis['sector'].value_counts()
+    sector_avg_values = df_analysis.groupby('sector')['fair_value'].mean().sort_values(ascending=False)
     
-    # RSI calculation
-    def calculate_rsi(prices, window=14):
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+    response = """
+## 📊 Sector Analysis
+
+**Sector Distribution:**
+"""
     
-    hist_data['RSI'] = calculate_rsi(hist_data['Close'])
+    for sector, count in sector_counts.head(10).items():
+        response += f"- {sector}: {count} companies\n"
     
-    # Create technical chart
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.1,
-        subplot_titles=('Price with Moving Averages', 'RSI'),
-        row_heights=[0.7, 0.3]
-    )
+    response += f"""
+
+**Average Fair Value by Sector (Top 10):**
+"""
     
-    # Price and moving averages
-    fig.add_trace(go.Scatter(x=hist_data.index, y=hist_data['Close'], name='Close', line=dict(color='blue')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=hist_data.index, y=hist_data['MA20'], name='MA20', line=dict(color='orange')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=hist_data.index, y=hist_data['MA50'], name='MA50', line=dict(color='red')), row=1, col=1)
+    for sector, avg_value in sector_avg_values.head(10).items():
+        response += f"- {sector}: ${avg_value/1e9:.2f}B\n"
     
-    # RSI
-    fig.add_trace(go.Scatter(x=hist_data.index, y=hist_data['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    response += """
+
+**Key Insights:**
+- Sectors with higher representation may indicate better financial health
+- Higher average fair values suggest sectors with strong fundamentals
+- Consider sector-specific risks and growth prospects
+"""
     
-    fig.update_layout(height=600, title="Technical Analysis")
-    st.plotly_chart(fig, use_container_width=True)
+    return response
 
 if __name__ == "__main__":
     main()
